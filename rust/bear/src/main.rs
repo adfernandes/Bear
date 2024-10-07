@@ -16,16 +16,12 @@
     You should have received a copy of the GNU General Public License
     along with this program.  If not, see <http://www.gnu.org/licenses/>.
  */
-use crate::command::{BuildCommand, BuildEvents, BuildSemantic, Mode};
 use anyhow::Context;
 use intercept::ipc::Execution;
 use json_compilation_db::Entry;
 use log;
-use semantic::events;
-use semantic::filter;
-use semantic::tools;
+use semantic;
 use serde_json::Error;
-use simple_logger::SimpleLogger;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -33,27 +29,32 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use crate::compilation::into_entries;
 
-mod command;
-mod configuration;
+mod args;
+mod config;
 mod fixtures;
+mod filter;
+mod compilation;
+pub mod events;
 
 /// Driver function of the application.
 fn main() -> anyhow::Result<ExitCode> {
-    // Parse the command line arguments.
-    let matches = command::cli().get_matches();
-    let arguments = command::Arguments::try_from(matches)?;
     // Initialize the logging system.
-    prepare_logging(arguments.verbose)?;
-
+    env_logger::init();
     // Get the package name and version from Cargo
     let pkg_name = env!("CARGO_PKG_NAME");
     let pkg_version = env!("CARGO_PKG_VERSION");
     log::debug!("{} v{}", pkg_name, pkg_version);
+
+    // Parse the command line arguments.
+    let matches = args::cli().get_matches();
+    let arguments = args::Arguments::try_from(matches)?;
+
     // Print the arguments.
     log::debug!("Arguments: {:?}", arguments);
     // Load the configuration.
-    let configuration = configuration::Configuration::load(&arguments.config)?;
+    let configuration = config::Main::load(&arguments.config)?;
     log::debug!("Configuration: {:?}", configuration);
 
     // Run the application.
@@ -64,33 +65,13 @@ fn main() -> anyhow::Result<ExitCode> {
     Ok(result)
 }
 
-/// Initializes the logging system.
-///
-/// Failure when the downstream library fails to initialize the logging system.
-fn prepare_logging(level: u8) -> anyhow::Result<()> {
-    let level = match level {
-        0 => log::LevelFilter::Error,
-        1 => log::LevelFilter::Warn,
-        2 => log::LevelFilter::Info,
-        3 => log::LevelFilter::Debug,
-        _ => log::LevelFilter::Trace,
-    };
-    let mut logger = SimpleLogger::new().with_level(level);
-    if level <= log::LevelFilter::Debug {
-        logger = logger.with_local_timestamps()
-    }
-    logger.init()?;
-
-    Ok(())
-}
-
 /// Represent the application state.
 enum Application {
     /// The intercept mode we are only capturing the build commands.
     Intercept {
-        input: BuildCommand,
-        output: BuildEvents,
-        intercept_config: configuration::Intercept,
+        input: args::BuildCommand,
+        output: args::BuildEvents,
+        intercept_config: config::Intercept,
     },
     /// The semantic mode we are deduct the semantic meaning of the
     /// executed commands from the build process.
@@ -102,10 +83,10 @@ enum Application {
     },
     /// The all model is combining the intercept and semantic modes.
     All {
-        input: BuildCommand,
-        output: BuildSemantic,
-        intercept_config: configuration::Intercept,
-        output_config: configuration::Output,
+        input: args::BuildCommand,
+        output: args::BuildSemantic,
+        intercept_config: config::Intercept,
+        output_config: config::Output,
     },
 }
 
@@ -116,12 +97,12 @@ impl Application {
     /// state that will be used by the `run` method. Trying to catch problems early before
     /// the actual execution of the application.
     fn configure(
-        arguments: command::Arguments,
-        configuration: configuration::Configuration,
+        args: args::Arguments,
+        config: config::Main,
     ) -> anyhow::Result<Self> {
-        match arguments.mode {
-            Mode::Intercept { input, output } => {
-                let intercept_config = configuration.intercept;
+        match args.mode {
+            args::Mode::Intercept { input, output } => {
+                let intercept_config = config.intercept;
                 let result = Application::Intercept {
                     input,
                     output,
@@ -129,11 +110,11 @@ impl Application {
                 };
                 Ok(result)
             }
-            Mode::Semantic { input, output } => {
+            args::Mode::Semantic { input, output } => {
                 let event_source = EventFileReader::try_from(input)?;
-                let semantic_recognition = SemanticRecognition::try_from(&configuration)?;
-                let semantic_transform = SemanticTransform::from(&configuration.output);
-                let output_writer = OutputWriter::configure(&output, &configuration.output);
+                let semantic_recognition = SemanticRecognition::try_from(&config)?;
+                let semantic_transform = SemanticTransform::from(&config.output);
+                let output_writer = OutputWriter::configure(&output, &config.output);
                 let result = Application::Semantic {
                     event_source,
                     semantic_recognition,
@@ -142,9 +123,9 @@ impl Application {
                 };
                 Ok(result)
             }
-            Mode::All { input, output } => {
-                let intercept_config = configuration.intercept;
-                let output_config = configuration.output;
+            args::Mode::All { input, output } => {
+                let intercept_config = config.intercept;
+                let output_config = config.output;
                 let result = Application::All {
                     input,
                     output,
@@ -206,13 +187,13 @@ struct EventFileReader {
     reader: BufReader<File>,
 }
 
-impl TryFrom<BuildEvents> for EventFileReader {
+impl TryFrom<args::BuildEvents> for EventFileReader {
     type Error = anyhow::Error;
 
     /// Open the file and create a new instance of the event file reader.
     ///
     /// If the file cannot be opened, the error will be logged and escalated.
-    fn try_from(value: BuildEvents) -> Result<Self, Self::Error> {
+    fn try_from(value: args::BuildEvents) -> Result<Self, Self::Error> {
         let file_name = PathBuf::from(value.file_name);
         let file = OpenOptions::new()
             .read(true)
@@ -248,45 +229,43 @@ impl EventFileReader {
 /// The recognition logic is implemented in the `tools` module. Here we only handle
 /// the errors and logging them to the console.
 struct SemanticRecognition {
-    tool: Box<dyn tools::Tool>,
+    tool: Box<dyn semantic::Tool>,
 }
 
-impl TryFrom<&configuration::Configuration> for SemanticRecognition {
+impl TryFrom<&config::Main> for SemanticRecognition {
     type Error = anyhow::Error;
 
-    fn try_from(value: &configuration::Configuration) -> Result<Self, Self::Error> {
-        let compilers_to_include = match &value.intercept {
-            configuration::Intercept::Wrapper { executables, .. } => executables.clone(),
-            _ => {
-                vec![]
-            }
+    fn try_from(config: &config::Main) -> Result<Self, Self::Error> {
+        let compilers_to_include = match &config.intercept {
+            config::Intercept::Wrapper { executables, .. } => executables.clone(),
+            _ => vec![],
         };
-        let compilers_to_exclude = match &value.output {
-            configuration::Output::Clang { filter, .. } => filter.compilers.with_paths.clone(),
-            _ => {
-                vec![]
-            }
+        let compilers_to_exclude = match &config.output {
+            config::Output::Clang { filter, .. } => filter.compilers.with_paths.clone(),
+            _ => vec![],
         };
-        let tool = tools::from(
-            compilers_to_include.as_slice(),
-            compilers_to_exclude.as_slice(),
-        );
-        Ok(SemanticRecognition { tool })
+        let arguments_to_exclude = match &config.output {
+            config::Output::Clang { filter, .. } => filter.compilers.with_arguments.clone(),
+            _ => vec![],
+        };
+        let tool = semantic::tools::Builder::new()
+            .compilers_to_recognize(compilers_to_include.as_slice())
+            .compilers_to_exclude(compilers_to_exclude.as_slice())
+            .compilers_to_exclude_by_arguments(arguments_to_exclude.as_slice())
+            .build();
+
+        Ok(SemanticRecognition { tool: Box::new(tool) })
     }
 }
 
 impl SemanticRecognition {
-    fn recognize(&self, execution: Execution) -> Option<tools::Semantic> {
+    fn recognize(&self, execution: Execution) -> Option<semantic::Meaning> {
         match self.tool.recognize(&execution) {
-            tools::RecognitionResult::Recognized(Ok(tools::Semantic::UnixCommand)) => {
-                log::debug!("execution recognized as unix command: {:?}", execution);
+            semantic::RecognitionResult::Recognized(Ok(semantic::Meaning::Ignored)) => {
+                log::debug!("execution recognized, but ignored: {:?}", execution);
                 None
             }
-            tools::RecognitionResult::Recognized(Ok(tools::Semantic::BuildCommand)) => {
-                log::debug!("execution recognized as build command: {:?}", execution);
-                None
-            }
-            tools::RecognitionResult::Recognized(Ok(semantic)) => {
+            semantic::RecognitionResult::Recognized(Ok(semantic)) => {
                 log::debug!(
                     "execution recognized as compiler call, {:?} : {:?}",
                     semantic,
@@ -294,7 +273,7 @@ impl SemanticRecognition {
                 );
                 Some(semantic)
             }
-            tools::RecognitionResult::Recognized(Err(reason)) => {
+            semantic::RecognitionResult::Recognized(Err(reason)) => {
                 log::debug!(
                     "execution recognized with failure, {:?} : {:?}",
                     reason,
@@ -302,7 +281,7 @@ impl SemanticRecognition {
                 );
                 None
             }
-            tools::RecognitionResult::NotRecognized => {
+            semantic::RecognitionResult::NotRecognized => {
                 log::debug!("execution not recognized: {:?}", execution);
                 None
             }
@@ -322,10 +301,10 @@ enum SemanticTransform {
     },
 }
 
-impl From<&configuration::Output> for SemanticTransform {
-    fn from(config: &configuration::Output) -> Self {
+impl From<&config::Output> for SemanticTransform {
+    fn from(config: &config::Output) -> Self {
         match config {
-            configuration::Output::Clang { transform, .. } => {
+            config::Output::Clang { transform, .. } => {
                 if transform.arguments_to_add.is_empty() && transform.arguments_to_remove.is_empty()
                 {
                     SemanticTransform::NoTransform
@@ -336,15 +315,15 @@ impl From<&configuration::Output> for SemanticTransform {
                     }
                 }
             }
-            configuration::Output::Semantic { .. } => SemanticTransform::NoTransform,
+            config::Output::Semantic { .. } => SemanticTransform::NoTransform,
         }
     }
 }
 
 impl SemanticTransform {
-    fn into_entries(&self, semantic: tools::Semantic) -> Vec<Entry> {
+    fn into_entries(&self, semantic: semantic::Meaning) -> Vec<Entry> {
         let transformed = self.transform_semantic(semantic);
-        let entries: Result<Vec<Entry>, anyhow::Error> = transformed.try_into();
+        let entries: Result<Vec<Entry>, anyhow::Error> = into_entries(transformed);
         entries.unwrap_or_else(|error| {
             log::debug!(
                 "compiler call failed to convert to compilation db entry: {}",
@@ -354,9 +333,9 @@ impl SemanticTransform {
         })
     }
 
-    fn transform_semantic(&self, input: tools::Semantic) -> tools::Semantic {
+    fn transform_semantic(&self, input: semantic::Meaning) -> semantic::Meaning {
         match input {
-            tools::Semantic::Compiler {
+            semantic::Meaning::Compiler {
                 compiler,
                 working_dir,
                 passes,
@@ -366,7 +345,7 @@ impl SemanticTransform {
                     .map(|pass| self.transform_pass(pass))
                     .collect();
 
-                tools::Semantic::Compiler {
+                semantic::Meaning::Compiler {
                     compiler,
                     working_dir,
                     passes: passes_transformed,
@@ -376,9 +355,9 @@ impl SemanticTransform {
         }
     }
 
-    fn transform_pass(&self, pass: tools::CompilerPass) -> tools::CompilerPass {
+    fn transform_pass(&self, pass: semantic::CompilerPass) -> semantic::CompilerPass {
         match pass {
-            tools::CompilerPass::Compile {
+            semantic::CompilerPass::Compile {
                 source,
                 output,
                 flags,
@@ -392,7 +371,7 @@ impl SemanticTransform {
                         .filter(|flag| !arguments_to_remove.contains(flag))
                         .chain(arguments_to_add.iter().cloned())
                         .collect();
-                    tools::CompilerPass::Compile {
+                    semantic::CompilerPass::Compile {
                         source,
                         output,
                         flags: flags_transformed,
@@ -415,21 +394,21 @@ impl SemanticTransform {
 struct OutputWriter {
     output: PathBuf,
     append: bool,
-    filter: configuration::Filter,
-    format: configuration::Format,
+    filter: config::Filter,
+    format: config::Format,
 }
 
 impl OutputWriter {
     /// Create a new instance of the output writer.
-    pub fn configure(value: &BuildSemantic, configuration: &configuration::Output) -> Self {
-        match configuration {
-            configuration::Output::Clang { format, filter, .. } => OutputWriter {
+    pub fn configure(value: &args::BuildSemantic, config: &config::Output) -> Self {
+        match config {
+            config::Output::Clang { format, filter, .. } => OutputWriter {
                 output: PathBuf::from(&value.file_name),
                 append: value.append,
                 filter: Self::validate_filter(filter),
                 format: format.clone(),
             },
-            configuration::Output::Semantic { .. } => {
+            config::Output::Semantic { .. } => {
                 todo!("implement this case")
             }
         }
@@ -438,7 +417,7 @@ impl OutputWriter {
     /// Validate the configuration of the output writer.
     ///
     /// Validation is always successful, but it may modify the configuration values.
-    fn validate_filter(filter: &configuration::Filter) -> configuration::Filter {
+    fn validate_filter(filter: &config::Filter) -> config::Filter {
         let mut result = filter.clone();
         result.duplicates.by_fields =
             Self::validate_duplicates_by_fields(filter.duplicates.by_fields.as_slice());
@@ -449,8 +428,8 @@ impl OutputWriter {
     ///
     /// Removes the duplicates from the list of fields.
     fn validate_duplicates_by_fields(
-        fields: &[configuration::OutputFields],
-    ) -> Vec<configuration::OutputFields> {
+        fields: &[config::OutputFields],
+    ) -> Vec<config::OutputFields> {
         fields
             .into_iter()
             .map(|field| field.clone())
@@ -536,11 +515,11 @@ impl OutputWriter {
     }
 }
 
-impl TryFrom<&configuration::Filter> for filter::EntryPredicate {
+impl TryFrom<&config::Filter> for filter::EntryPredicate {
     type Error = anyhow::Error;
 
     /// Create a filter from the configuration.
-    fn try_from(config: &configuration::Filter) -> Result<Self, Self::Error> {
+    fn try_from(config: &config::Filter) -> Result<Self, Self::Error> {
         // - Check if the source file exists
         // - Check if the source file is not in the exclude list of the configuration
         // - Check if the source file is in the include list of the configuration
@@ -571,15 +550,15 @@ impl TryFrom<&configuration::Filter> for filter::EntryPredicate {
     }
 }
 
-fn create_hash(fields: Vec<configuration::OutputFields>) -> impl Fn(&Entry) -> u64 + 'static {
+fn create_hash(fields: Vec<config::OutputFields>) -> impl Fn(&Entry) -> u64 + 'static {
     move |entry: &Entry| {
         let mut hasher = DefaultHasher::new();
         for field in &fields {
             match field {
-                configuration::OutputFields::Directory => entry.directory.hash(&mut hasher),
-                configuration::OutputFields::File => entry.file.hash(&mut hasher),
-                configuration::OutputFields::Arguments => entry.arguments.hash(&mut hasher),
-                configuration::OutputFields::Output => entry.output.hash(&mut hasher),
+                config::OutputFields::Directory => entry.directory.hash(&mut hasher),
+                config::OutputFields::File => entry.file.hash(&mut hasher),
+                config::OutputFields::Arguments => entry.arguments.hash(&mut hasher),
+                config::OutputFields::Output => entry.output.hash(&mut hasher),
             }
         }
         hasher.finish()

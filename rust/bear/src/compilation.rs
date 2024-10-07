@@ -23,37 +23,33 @@ use anyhow::{anyhow, Result};
 use json_compilation_db::Entry;
 use path_absolutize::Absolutize;
 
-use crate::tools::{CompilerPass, Semantic};
+use semantic::{CompilerPass, Meaning};
 
-impl TryFrom<Semantic> for Vec<Entry> {
-    type Error = anyhow::Error;
+pub fn into_entries(value: Meaning) -> Result<Vec<Entry>, anyhow::Error> {
+    match value {
+        Meaning::Compiler { compiler, working_dir, passes } => {
+            let entries = passes.iter()
+                .flat_map(|pass| -> Result<Entry, anyhow::Error> {
+                    match pass {
+                        CompilerPass::Preprocess =>
+                            Err(anyhow!("preprocess pass should not show up in results")),
+                        CompilerPass::Compile { source, output, flags } =>
+                            Ok(
+                                Entry {
+                                    file: into_abspath(source.clone(), working_dir.as_path())?,
+                                    directory: working_dir.clone(),
+                                    output: into_abspath_opt(output.clone(), working_dir.as_path())?,
+                                    arguments: into_arguments(&compiler, source, output, flags)?,
+                                }
+                            )
+                    }
+                })
+                .collect();
 
-    fn try_from(value: Semantic) -> Result<Self, Self::Error> {
-        match value {
-            Semantic::Compiler { compiler, working_dir, passes } => {
-                let entries = passes.iter()
-                    .flat_map(|pass| -> Result<Entry, Self::Error> {
-                        match pass {
-                            CompilerPass::Preprocess =>
-                                Err(anyhow!("preprocess pass should not show up in results")),
-                            CompilerPass::Compile { source, output, flags } =>
-                                Ok(
-                                    Entry {
-                                        file: into_abspath(source.clone(), working_dir.as_path())?,
-                                        directory: working_dir.clone(),
-                                        output: into_abspath_opt(output.clone(), working_dir.as_path())?,
-                                        arguments: into_arguments(&compiler, source, output, flags)?,
-                                    }
-                                )
-                        }
-                    })
-                    .collect();
-
-                Ok(entries)
-            }
-            _ =>
-                Ok(vec![]),
+            Ok(entries)
         }
+        _ =>
+            Ok(vec![]),
     }
 }
 
@@ -101,24 +97,21 @@ fn into_string(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod test {
     use crate::vec_of_strings;
-
     use super::*;
 
     #[test]
     fn test_non_compilations() -> Result<()> {
         let empty: Vec<Entry> = vec![];
 
-        let result: Vec<Entry> = Semantic::UnixCommand.try_into()?;
-        assert_eq!(empty, result);
-        let result: Vec<Entry> = Semantic::BuildCommand.try_into()?;
+        let result: Vec<Entry> = into_entries(Meaning::Ignored)?;
         assert_eq!(empty, result);
 
-        let input = Semantic::Compiler {
+        let input = Meaning::Compiler {
             compiler: PathBuf::from("/usr/bin/cc"),
             working_dir: PathBuf::from("/home/user"),
             passes: vec![],
         };
-        let result: Vec<Entry> = input.try_into()?;
+        let result: Vec<Entry> = into_entries(input)?;
         assert_eq!(empty, result);
 
         Ok(())
@@ -126,7 +119,7 @@ mod test {
 
     #[test]
     fn test_single_source_compilation() -> Result<()> {
-        let input = Semantic::Compiler {
+        let input = Meaning::Compiler {
             compiler: PathBuf::from("clang"),
             working_dir: PathBuf::from("/home/user"),
             passes: vec![
@@ -147,7 +140,7 @@ mod test {
             }
         ];
 
-        let result: Vec<Entry> = input.try_into()?;
+        let result: Vec<Entry> = into_entries(input)?;
 
         assert_eq!(expected, result);
 
@@ -156,7 +149,7 @@ mod test {
 
     #[test]
     fn test_multiple_sources_compilation() -> Result<()> {
-        let input = Semantic::Compiler {
+        let input = Meaning::Compiler {
             compiler: PathBuf::from("clang"),
             working_dir: PathBuf::from("/home/user"),
             passes: vec![
@@ -189,7 +182,7 @@ mod test {
             },
         ];
 
-        let result: Vec<Entry> = input.try_into()?;
+        let result: Vec<Entry> = into_entries(input)?;
 
         assert_eq!(expected, result);
 

@@ -20,30 +20,23 @@
 use std::path::{Path, PathBuf};
 use std::vec;
 
+use super::super::{CompilerPass, Meaning, RecognitionResult, Tool};
+use super::matchers::source::looks_like_a_source_file;
 use intercept::ipc::Execution;
-use crate::tools::{CompilerPass, Semantic};
-use crate::tools::{Any, RecognitionResult, Tool};
-use crate::tools::matchers::source::looks_like_a_source_file;
-use crate::tools::RecognitionResult::{NotRecognized, Recognized};
 
-pub struct Configured {
+pub struct Generic {
     pub executable: PathBuf,
 }
 
-impl Configured {
+impl Generic {
     pub fn new(compiler: &Path) -> Box<dyn Tool> {
-        Box::new(Self { executable: compiler.to_path_buf() })
-    }
-
-    pub fn from(compilers: &[PathBuf]) -> Box<dyn Tool> {
-        let tools = compilers.iter()
-            .map(|compiler| Self::new(compiler.as_path()))
-            .collect();
-        Any::new(tools)
+        Box::new(Self {
+            executable: compiler.to_path_buf(),
+        })
     }
 }
 
-impl Tool for Configured {
+impl Tool for Generic {
     /// Any of the tool recognize the semantic, will be returned as result.
     fn recognize(&self, x: &Execution) -> RecognitionResult {
         if x.executable == self.executable {
@@ -60,28 +53,23 @@ impl Tool for Configured {
             }
 
             if sources.is_empty() {
-                Recognized(Err(String::from("source file is not found")))
+                RecognitionResult::Recognized(Err(String::from("source file is not found")))
             } else {
-                Recognized(
-                    Ok(
-                        Semantic::Compiler {
-                            compiler: x.executable.clone(),
-                            working_dir: x.working_dir.clone(),
-                            passes: sources.iter()
-                                .map(|source| {
-                                    CompilerPass::Compile {
-                                        source: source.clone(),
-                                        output: None,
-                                        flags: flags.clone(),
-                                    }
-                                })
-                                .collect(),
-                        }
-                    )
-                )
+                RecognitionResult::Recognized(Ok(Meaning::Compiler {
+                    compiler: x.executable.clone(),
+                    working_dir: x.working_dir.clone(),
+                    passes: sources
+                        .iter()
+                        .map(|source| CompilerPass::Compile {
+                            source: source.clone(),
+                            output: None,
+                            flags: flags.clone(),
+                        })
+                        .collect(),
+                }))
             }
         } else {
-            NotRecognized
+            RecognitionResult::NotRecognized
         }
     }
 }
@@ -100,24 +88,32 @@ mod test {
     fn test_matching() {
         let input = Execution {
             executable: PathBuf::from("/usr/bin/something"),
-            arguments: vec_of_strings!["something", "-Dthis=that", "-I.", "source.c", "-o", "source.c.o"],
+            arguments: vec_of_strings![
+                "something",
+                "-Dthis=that",
+                "-I.",
+                "source.c",
+                "-o",
+                "source.c.o"
+            ],
             working_dir: PathBuf::from("/home/user"),
             environment: HashMap::new(),
         };
 
-        let expected = Semantic::Compiler {
+        let expected = Meaning::Compiler {
             compiler: PathBuf::from("/usr/bin/something"),
             working_dir: PathBuf::from("/home/user"),
-            passes: vec![
-                CompilerPass::Compile {
-                    flags: vec_of_strings!["-Dthis=that", "-I.", "-o", "source.c.o"],
-                    source: PathBuf::from("source.c"),
-                    output: None,
-                }
-            ],
+            passes: vec![CompilerPass::Compile {
+                flags: vec_of_strings!["-Dthis=that", "-I.", "-o", "source.c.o"],
+                source: PathBuf::from("source.c"),
+                output: None,
+            }],
         };
 
-        assert_eq!(Recognized(Ok(expected)), SUT.recognize(&input));
+        assert_eq!(
+            RecognitionResult::Recognized(Ok(expected)),
+            SUT.recognize(&input)
+        );
     }
 
     #[test]
@@ -129,7 +125,10 @@ mod test {
             environment: HashMap::new(),
         };
 
-        assert_eq!(Recognized(Err(String::from("source file is not found"))), SUT.recognize(&input));
+        assert_eq!(
+            RecognitionResult::Recognized(Err(String::from("source file is not found"))),
+            SUT.recognize(&input)
+        );
     }
 
     #[test]
@@ -141,11 +140,11 @@ mod test {
             environment: HashMap::new(),
         };
 
-        assert_eq!(NotRecognized, SUT.recognize(&input));
+        assert_eq!(RecognitionResult::NotRecognized, SUT.recognize(&input));
     }
 
     lazy_static! {
-        static ref SUT: Configured = Configured {
+        static ref SUT: Generic = Generic {
             executable: PathBuf::from("/usr/bin/something"),
         };
     }
